@@ -1,0 +1,25 @@
+# Local Python environments and build products
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# vLLM, FlashInfer, Triton, and compiler caches
+cache/
+
+# Runtime CRIU state and checkpoint images
+checkpoints/
+.vllm-criu-*.log
+.vllm-criu-*
+
+# Local OS/editor files
+.DS_Store
+.idea/
+.vscode/
