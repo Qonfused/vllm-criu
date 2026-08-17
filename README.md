@@ -10,7 +10,7 @@ After the configured idle period, `vllm-guard.js` sends `POST /launcher/suspend`
 
 On resume, `POST /launcher/resume` first runs `criu restore` and restores the CUDA process. Once the API server is ready, the EngineCore patches replace stale socket readers and reconnect the API and EngineCore channels. The worker then reinitializes its CUDA state, reloads model weights, allocates the KV cache, and resumes scheduling. Graph preservation is optional. When it is disabled or cannot reuse the restored graph state, the worker recaptures graphs or uses eager execution.
 
-Because CRIU restores the process tree, a successful resume does not start a new vLLM process. However, the worker still transfers model weights to the GPU and rebuilds the KV cache, so those costs remain part of resume time. After a successful restore, the launcher deletes the checkpoint directory. The next suspend creates a new checkpoint. If restore fails and fallback is enabled, the launcher starts a fresh vLLM process.
+Because CRIU restores the process tree, a successful resume does not start a new vLLM process. However, the worker still transfers model weights to the GPU and rebuilds the KV cache, so those costs remain part of resume time. After a successful restore, the launcher deletes the checkpoint directory. The next suspend creates a new checkpoint. If restore fails and fallback is enabled, the launcher starts one fresh vLLM process and waits for that replacement to become API-ready before reporting the failure or allowing another resume attempt.
 
 ## Requirements
 

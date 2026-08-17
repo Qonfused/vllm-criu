@@ -33,6 +33,7 @@ class Settings:
   control_port: int = 9000
   checkpoint_dir: Path = Path("/checkpoints/current")
   checkpoint_timeout: int = 120
+  fallback_timeout: int = 180
   checkpoint_sleep_level: int = 2
   allocator_reinit: bool = True
   restore_fallback_fresh: bool = True
@@ -47,6 +48,7 @@ class Settings:
       raise ValueError(
         "LAUNCHER_RESOURCE_TRACKER_MODE must be keep, terminate, or externalize"
       )
+    checkpoint_timeout = int(os.environ.get("LAUNCHER_CHECKPOINT_TIMEOUT", "120"))
     return cls(
       model_id=os.environ["MODEL_ID"],
       model_name=os.environ["MODEL_NAME"],
@@ -63,7 +65,10 @@ class Settings:
       checkpoint_dir=Path(
         os.environ.get("LAUNCHER_CHECKPOINT_DIR", "/checkpoints/current")
       ),
-      checkpoint_timeout=int(os.environ.get("LAUNCHER_CHECKPOINT_TIMEOUT", "120")),
+      checkpoint_timeout=checkpoint_timeout,
+      fallback_timeout=int(
+        os.environ.get("LAUNCHER_FALLBACK_TIMEOUT", str(max(checkpoint_timeout, 180)))
+      ),
       checkpoint_sleep_level=int(os.environ.get("LAUNCHER_CHECKPOINT_SLEEP_LEVEL", "2")),
       allocator_reinit=_bool_env("VLLM_LIFECYCLE_ALLOCATOR_REINIT", True),
       restore_fallback_fresh=_bool_env("LAUNCHER_RESTORE_FALLBACK_FRESH", True),

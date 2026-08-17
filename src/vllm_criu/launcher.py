@@ -441,7 +441,11 @@ def restore_vllm() -> dict[str, object]:
       try:
         _archive_failed_checkpoint()
         process = start_vllm()
-        deadline = time.monotonic() + settings.checkpoint_timeout
+        # A cold fallback has to load the model, initialize the KV cache, and
+        # capture the configured CUDA graphs. That is a different timeout from
+        # the CRIU restore watchdog above; do not kill a healthy replacement
+        # merely because the failed restore reached its shorter deadline.
+        deadline = time.monotonic() + settings.fallback_timeout
         while not api.ready() and time.monotonic() < deadline:
           time.sleep(0.25)
         if api.ready():
