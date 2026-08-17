@@ -8,6 +8,9 @@
 //     releasing GPU memory (weights offloaded to CPU RAM, KV cache discarded)
 //   * Optionally asks the vLLM launcher to checkpoint the post-level-2 process
 //     state to disk (CHECKPOINT_MODE=criu)
+//   * Treats OMP session heartbeats (POST /heartbeat) as activity so the
+//     engine stays warm while a session is alive; the sleep countdown starts
+//     when the last heartbeat stops
 //   * Blocks vLLM's dev-mode endpoints so they stay on the internal network
 //
 // If the upstream was started without --enable-sleep-mode (GET /is_sleeping
@@ -18,7 +21,7 @@
 //   LISTEN_PORT    port to bind               (default 8001)
 //   IDLE_TIMEOUT   seconds of inactivity before sleep (default 300)
 //   POLL_INTERVAL  seconds between /metrics polls     (default 15)
-//   WAKE_TIMEOUT   max seconds to wait for a wake-up  (default 120)
+//   WAKE_TIMEOUT   max seconds to wait for a wake-up  (default 300)
 //   SLEEP_LEVEL    1 = weights to RAM, 2 = discard weights (default 2)
 //   CONTROL_URL    internal vLLM launcher URL        (default http://vllm:9000)
 //   CHECKPOINT_MODE off or criu; criu is opt-in       (default off)
@@ -28,7 +31,7 @@ const CONTROL = (process.env.CONTROL_URL ?? "http://vllm:9000").replace(/\/+$/, 
 const PORT = Number(process.env.LISTEN_PORT ?? 8001);
 const IDLE_TIMEOUT_MS = Number(process.env.IDLE_TIMEOUT ?? 300) * 1000;
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL ?? 15) * 1000;
-const WAKE_TIMEOUT_MS = Number(process.env.WAKE_TIMEOUT ?? 120) * 1000;
+const WAKE_TIMEOUT_MS = Number(process.env.WAKE_TIMEOUT ?? 300) * 1000;
 const SLEEP_LEVEL = process.env.SLEEP_LEVEL ?? "2";
 const CHECKPOINT_MODE = process.env.CHECKPOINT_MODE ?? "off";
 
@@ -57,9 +60,11 @@ const log = (...a) => console.log(new Date().toISOString(), ...a);
 
 let inFlight = 0; // requests currently being proxied
 let lastActive = Date.now();
+let lastHeartbeat = null; // last OMP session heartbeat (ms epoch)
 let lastGen = null; // last observed vllm:generation_tokens_total
 let sleepMode = null; // null = unprobed, true = available, false = unavailable
 let checkpointed = false;
+let launcherState = null;
 let wakePromise = null; // single-flight wake-up
 let sleepPromise = null; // single-flight sleep
 
@@ -106,23 +111,83 @@ async function postControl(path, init = {}) {
   }
 }
 
+async function getLauncherHealth() {
+  const r = await fetch(CONTROL + "/launcher/healthz", { redirect: "manual" });
+  const body = await r.json();
+  if (typeof body.state !== "string") {
+    throw new Error("launcher health response did not include state");
+  }
+  return body;
+}
+
 // The guard's checkpointed flag is intentionally in-memory. The vLLM
-// container can nevertheless be recreated independently of the guard, so a
-// previously checkpointed flag must not make us restore an image belonging to
-// an older launcher process tree. The launcher state is authoritative when it
-// is available: a fresh launcher in `starting` or `running` state wins over
-// the guard's stale flag.
+// container can nevertheless be checkpointed independently of the guard, so
+// a restarted guard must discover the launcher's durable state before it
+// probes the vLLM API. The launcher state is authoritative when it is
+// available: `checkpointed` means that the next request must restore the
+// process tree, while a fresh `starting` or `running` launcher invalidates a
+// stale guard flag.
 async function reconcileCheckpointState() {
-  if (!checkpointed) return;
+  if (CHECKPOINT_MODE !== "criu") return null;
   try {
-    const r = await fetch(CONTROL + "/launcher/healthz", { redirect: "manual" });
-    const body = await r.json();
-    if (["starting", "running"].includes(body.state)) {
+    const body = await getLauncherHealth();
+    const previousState = launcherState;
+    launcherState = body.state;
+    if (body.state === "checkpointed") {
+      if (!checkpointed) log("launcher reports a durable checkpoint");
+      checkpointed = true;
+    } else if (["starting", "running"].includes(body.state)) {
+      if (checkpointed) {
+        log(`launcher reports state=${body.state}; clearing stale checkpoint flag`);
+      }
       checkpointed = false;
-      log(`launcher reports state=${body.state}; ignoring stale checkpoint flag`);
     }
+    if (previousState !== body.state && body.state === "restoring") {
+      log("launcher is restoring the checkpointed vLLM process tree");
+    }
+    return body;
   } catch (e) {
     log(`could not reconcile launcher checkpoint state: ${e.message}`);
+    return null;
+  }
+}
+
+async function waitForLauncherRunning(deadline) {
+  for (;;) {
+    const body = await getLauncherHealth();
+    launcherState = body.state;
+    if (body.state === "running" && body.ok) return body;
+    if (body.state === "checkpointed") {
+      checkpointed = true;
+      throw new Error("launcher returned to checkpointed state during wake-up");
+    }
+    if (body.state === "failed" || body.state === "stopped") {
+      throw new Error(`launcher is ${body.state}`);
+    }
+    if (Date.now() > deadline) {
+      throw new Error(`launcher did not become running within ${WAKE_TIMEOUT_MS / 1000}s`);
+    }
+    await sleep(250);
+  }
+}
+
+// A failed restore can transition directly into the configured fresh-vLLM
+// fallback.  During that transition the launcher may report checkpointed or
+// restoring before it reports running, so do not issue a second resume from a
+// concurrent client request.  This helper deliberately waits through those
+// intermediate states and only returns after the replacement API is healthy.
+async function waitForLauncherRecovery(deadline) {
+  for (;;) {
+    const body = await getLauncherHealth();
+    launcherState = body.state;
+    if (body.state === "running" && body.ok) return body;
+    if (body.state === "failed" || body.state === "stopped") {
+      throw new Error(`launcher fallback ended in ${body.state}`);
+    }
+    if (Date.now() > deadline) {
+      throw new Error(`launcher fallback did not become ready within ${WAKE_TIMEOUT_MS / 1000}s`);
+    }
+    await sleep(250);
   }
 }
 
@@ -145,14 +210,24 @@ async function ensureAwake() {
   wakePromise = (async () => {
     try {
       const t0 = Date.now();
-      if (checkpointed) {
-        await reconcileCheckpointState();
-      }
+      const deadline = Date.now() + WAKE_TIMEOUT_MS;
+      const health = await reconcileCheckpointState();
       if (checkpointed) {
         log("engine is checkpointed — restoring launcher process tree");
-        await postControl("/launcher/resume");
         checkpointed = false;
+        try {
+          const result = await postControl("/launcher/resume");
+          launcherState = result.state ?? "running";
+        } catch (error) {
+          // restore_vllm may have already archived the failed image and
+          // started a cold vLLM fallback before its control request returns
+          // the restore error. Wait for that one transition to finish rather
+          // than retrying resume against the same checkpoint.
+          log(`checkpoint restore failed; waiting for launcher fallback: ${error.message}`);
+          await waitForLauncherRecovery(deadline);
+        }
       }
+      if (health?.state === "restoring") await waitForLauncherRunning(deadline);
       if (!(await isSleeping())) return;
       log("engine is asleep — waking up before forwarding request");
       if (SLEEP_LEVEL === "2") {
@@ -165,7 +240,6 @@ async function ensureAwake() {
       } else {
         await postUpstream("/wake_up");
       }
-      const deadline = Date.now() + WAKE_TIMEOUT_MS;
       for (;;) {
         if (!(await isSleeping())) break;
         if (Date.now() > deadline) throw new Error(`wake-up timed out after ${WAKE_TIMEOUT_MS / 1000}s`);
@@ -199,7 +273,7 @@ async function trySleep() {
   // A newly started guard has not probed /is_sleeping yet. Allow the first
   // idle check to discover the upstream state; returning while sleepMode is
   // null would permanently disable automatic sleep for an idle fresh server.
-  if (sleepMode === false || sleepPromise || inFlight > 0) return;
+  if (sleepMode === false || sleepPromise || wakePromise || inFlight > 0) return;
   let currentlySleeping;
   try {
     currentlySleeping = await isSleeping();
@@ -242,8 +316,9 @@ async function trySleep() {
 async function idleLoop() {
   for (;;) {
     await sleep(POLL_INTERVAL_MS);
-    if (checkpointed) continue;
-    if (inFlight > 0) {
+    await reconcileCheckpointState();
+    if (checkpointed || launcherState === "restoring") continue;
+    if (inFlight > 0 || wakePromise || sleepPromise) {
       lastActive = Date.now();
       continue;
     }
@@ -282,9 +357,21 @@ Bun.serve({
         sleepMode,
         checkpointed,
         checkpointMode: CHECKPOINT_MODE,
+        launcherState,
+        wakeInProgress: wakePromise !== null,
         inFlight,
         idleSeconds: Math.round((Date.now() - lastActive) / 1000),
+        sessionHeartbeatSeconds:
+          lastHeartbeat == null ? null : Math.round((Date.now() - lastHeartbeat) / 1000),
       });
+    }
+    if (url.pathname === "/heartbeat" && req.method === "POST") {
+      // OMP session liveness: each session container heartbeats while alive.
+      // Counting it as activity keeps the engine warm for idle-but-alive
+      // sessions; the sleep countdown starts when the last heartbeat stops.
+      lastActive = Date.now();
+      lastHeartbeat = Date.now();
+      return Response.json({ ok: true });
     }
 
     if (BLOCKED_PATHS.has(url.pathname)) {
@@ -314,6 +401,9 @@ Bun.serve({
       return new Response(`upstream error: ${e.message}`, { status: 502 });
     } finally {
       inFlight--;
+      // Idle time begins after the request has actually completed (or the
+      // client has disconnected), not when a potentially long restore began.
+      lastActive = Date.now();
     }
   },
 });
@@ -323,4 +413,7 @@ log(
   `(idle timeout ${IDLE_TIMEOUT_MS / 1000}s, poll ${POLL_INTERVAL_MS / 1000}s, ` +
   `sleep level ${SLEEP_LEVEL}, checkpoint mode ${CHECKPOINT_MODE})`,
 );
-idleLoop();
+
+// Reconcile immediately so a guard restart notices a checkpoint that was
+// created by an earlier guard process before the first client request arrives.
+reconcileCheckpointState().finally(() => idleLoop());
